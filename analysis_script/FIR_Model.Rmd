@@ -1,0 +1,400 @@
+---
+title: "FIR_Model_Gaze_probability"
+author: "Sophie Su"
+date: "2025-12-07"
+output: html_document
+---
+
+```{r model_clear}
+library(dplyr)
+library(ggplot2)
+library(lme4)
+library(broom)
+library(broom.mixed)
+library(tidyr)
+library(lmtest)
+library(car)
+
+master<-read.csv("../Data/master_gaze_entropy.csv")
+participants_master<-read.csv("../Data/participant_master_gaze_entropy.csv")
+```
+
+# ----------------------------------------------------------------------------
+# STEP 1: Create BOTH Leads (negative lags) and Lags (positive lags)
+# ----------------------------------------------------------------------------
+```{r complete_modeling}
+# Define temporal window IN SECONDS (since each row = 1 second)
+MIN_LAG <- -10   # 10 SECONDS before the event
+MAX_LAG <- 10  # 10 SECONDS after the event
+
+cat("=== TEMPORAL WINDOW SETUP ===\n")
+cat("Each row represents: 1 second of video\n")
+cat("Anticipatory window:", abs(MIN_LAG), "seconds before event\n")
+cat("Reactive window:", MAX_LAG, "seconds after event\n")
+cat("Total temporal window:", abs(MIN_LAG) + MAX_LAG, "seconds\n\n")
+
+# Function to create leads and lags
+create_leads_lags <- function(df, var, min_lag, max_lag) {
+  df <- df %>%
+    arrange(movie, frame) %>%
+    group_by(movie)
+  
+  # Create all lags in the range [min_lag, max_lag]
+  for (i in min_lag:max_lag) {
+    col_name <- paste0(var, "_lag_", i)
+    
+    if (i < 0) {
+      # Negative lag = LEAD (future values)
+      df <- df %>%
+        mutate(!!col_name := lead(.data[[var]], n = abs(i)))
+    } else if (i == 0) {
+      # Current time point
+      df <- df %>%
+        mutate(!!col_name := .data[[var]])
+    } else {
+      # Positive lag (past values)
+      df <- df %>%
+        mutate(!!col_name := lag(.data[[var]], n = i))
+    }
+  }
+  
+  df <- df %>% ungroup()
+  return(df)
+}
+
+# Apply bidirectional lagging
+master_fir <- create_leads_lags(
+  master, 
+  "seg_prob_coarse", 
+  MIN_LAG, 
+  MAX_LAG
+)
+
+# Check created columns
+cat("=== COLUMNS CREATED ===\n")
+lag_cols <- names(master_fir)[grepl("seg_prob_coarse_lag", names(master_fir))]
+print(lag_cols)
+
+# Remove rows with NA in any lead/lag
+master_fir <- master_fir %>%
+  filter(complete.cases(select(., starts_with("seg_prob_coarse_lag"))))
+
+cat("\n=== DATA SUMMARY ===\n")
+cat("Original rows:", nrow(master), "\n")
+cat("After removing incomplete cases:", nrow(master_fir), "\n")
+cat("Rows lost per movie (approx):", abs(MIN_LAG) + MAX_LAG, "seconds\n\n")
+
+# Check per-movie sample sizes
+master_fir %>%
+  group_by(movie) %>%
+  summarise(
+    n_seconds = n(),
+    duration_minutes = n() / 60,
+    first_frame = min(frame),
+    last_frame = max(frame)
+  ) %>%
+  print()
+
+```
+
+# Understand the 
+```{r step2}
+# ----------------------------------------------------------------------------
+# STEP 2: Fit the Bidirectional FIR Model 
+# ----------------------------------------------------------------------------
+
+# Build formula with backticks around ALL lag names (including negative ones)
+lag_terms <- paste0("`seg_prob_coarse_lag_", MIN_LAG:MAX_LAG, "`")
+
+fir_formula <- as.formula(paste("gaze_entropy ~", paste(lag_terms, collapse = " + ")))
+
+cat("\n=== FITTING MODEL ===\n")
+cat("Formula (first few terms):\n")
+cat("sacc_amp_px_sm ~ ")
+cat(paste(head(lag_terms, 5), collapse = " + "))
+cat(" + ... \n")
+cat("Number of predictors:", length(lag_terms), "\n\n")
+
+# Verify all columns exist
+expected_cols <- paste0("seg_prob_coarse_lag_", MIN_LAG:MAX_LAG)
+if (!all(expected_cols %in% names(master_fir))) {
+  missing <- setdiff(expected_cols, names(master_fir))
+  stop("Missing columns: ", paste(missing, collapse = ", "))
+}
+
+# Fit model
+model_fir <- lm(fir_formula, data = master_fir)
+
+# Summary
+cat("Model fitted successfully!\n\n")
+summary(model_fir)
+```
+
+# ----------------------------------------------------------------------------
+# STEP 3: Extract Impulse Response Function (IRF)
+# ----------------------------------------------------------------------------
+```{r}
+irf_coefs <- broom::tidy(model_fir) %>%
+  filter(grepl("seg_prob_coarse_lag", term)) %>%
+  mutate(
+    # Remove backticks and extract lag number
+    term_clean = gsub("`", "", term),
+    lag = as.integer(gsub("seg_prob_coarse_lag_", "", term_clean)),
+    lag_seconds = lag,  # Each lag unit = 1 second
+    timing = case_when(
+      lag < 0 ~ "Anticipatory (Lead)",
+      lag == 0 ~ "Concurrent",
+      lag > 0 ~ "Reactive (Lag)"
+    ),
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+cat("\n=== IMPULSE RESPONSE COEFFICIENTS ===\n")
+print(irf_coefs %>% select(lag, lag_seconds, estimate, std.error, p.value, significant), 
+      n = Inf)
+
+# ----------------------------------------------------------------------------
+# STEP 4: Visualize the Bidirectional Impulse Response Function
+# ----------------------------------------------------------------------------
+
+cat("\n=== CREATING VISUALIZATIONS ===\n")
+
+# Plot 1: Full bidirectional IRF with confidence intervals
+p1 <- ggplot(irf_coefs, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_ribbon(aes(ymin = estimate - 1.96 * std.error,
+                  ymax = estimate + 1.96 * std.error),
+              alpha = 0.2, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(aes(color = significant, size = significant)) +
+  scale_color_manual(
+    values = c("FALSE" = "gray60", "TRUE" = "darkred"),
+    labels = c("FALSE" = "n.s.", "TRUE" = "p < 0.05")
+  ) +
+  scale_size_manual(values = c("FALSE" = 2, "TRUE" = 4)) +
+  annotate("rect", xmin = min(irf_coefs$lag_seconds), xmax = 0, 
+           ymin = -Inf, ymax = Inf, alpha = 0.05, fill = "blue") +
+  annotate("rect", xmin = 0, xmax = max(irf_coefs$lag_seconds), 
+           ymin = -Inf, ymax = Inf, alpha = 0.05, fill = "green") +
+  annotate("text", x = min(irf_coefs$lag_seconds) + 0.5, 
+           y = max(irf_coefs$estimate + 1.96*irf_coefs$std.error) * 0.9,
+           label = "ANTICIPATORY\n(before boundary)", 
+           hjust = 0, size = 4, color = "darkblue", fontface = "bold") +
+  annotate("text", x = max(irf_coefs$lag_seconds) - 0.5, 
+           y = max(irf_coefs$estimate + 1.96*irf_coefs$std.error) * 0.9,
+           label = "REACTIVE\n(after boundary)", 
+           hjust = 1, size = 4, color = "darkgreen", fontface = "bold") +
+  scale_x_continuous(breaks = seq(MIN_LAG, MAX_LAG, by = 2)) +
+  labs(
+    title = "Bidirectional Impulse Response: Event Boundary ↔ Fixation Duration",
+    subtitle = sprintf("Temporal window: %d seconds before to %d seconds after event (1Hz data)", 
+                       abs(MIN_LAG), MAX_LAG),
+    x = "Time relative to event boundary (seconds)\n← Before Event | After Event →",
+    y = "Effect on Fixation Duration (ms)",
+    color = "Significance",
+    size = "Significance",
+    caption = paste0("FIR model with ", length(MIN_LAG:MAX_LAG), 
+                     " temporal positions | Each lag = 1 second")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    legend.position = "top"
+  )
+
+print(p1)
+
+# Plot 2: Separate panels for anticipatory vs reactive
+irf_coefs <- irf_coefs %>%
+  mutate(
+    phase = ifelse(lag < 0, "Anticipatory (Leads)", "Reactive (Lags)"),
+    phase = factor(phase, levels = c("Anticipatory (Leads)", "Reactive (Lags)"))
+  )
+
+p2 <- ggplot(irf_coefs %>% filter(lag != 0), 
+             aes(x = abs(lag_seconds), y = estimate, color = phase)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_line(linewidth = 1.2) +
+  geom_point(aes(size = significant)) +
+  geom_errorbar(aes(ymin = estimate - 1.96 * std.error,
+                    ymax = estimate + 1.96 * std.error),
+                width = 0.3, alpha = 0.6) +
+  scale_color_manual(values = c("Anticipatory (Leads)" = "darkblue", 
+                                  "Reactive (Lags)" = "darkgreen")) +
+  scale_size_manual(values = c("FALSE" = 2, "TRUE" = 5)) +
+  facet_wrap(~phase, ncol = 2, scales = "free_x") +
+  labs(
+    title = "Anticipatory vs Reactive Effects",
+    subtitle = "X-axis shows absolute time from boundary",
+    x = "Time from event boundary (seconds)",
+    y = "Coefficient Estimate (ms)",
+    color = "Temporal Phase",
+    size = "p < 0.05"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+print(p2)
+
+
+
+# ----------------------------------------------------------------------------
+# STEP 5: Statistical Tests for Anticipatory vs Reactive Effects
+# ----------------------------------------------------------------------------
+
+cat("\n=== STATISTICAL ANALYSIS OF TEMPORAL EFFECTS ===\n")
+
+anticipatory_coefs <- irf_coefs %>% filter(lag < 0)
+reactive_coefs <- irf_coefs %>% filter(lag > 0)
+concurrent_coef <- irf_coefs %>% filter(lag == 0)
+
+cat("\n=== ANTICIPATORY EFFECTS (Leads) ===\n")
+cat("Number of significant leads:", sum(anticipatory_coefs$significant), "/", 
+    nrow(anticipatory_coefs), "\n")
+cat("Mean effect size:", round(mean(anticipatory_coefs$estimate), 3), "ms\n")
+cat("Median effect size:", round(median(anticipatory_coefs$estimate), 3), "ms\n")
+cat("Range:", round(range(anticipatory_coefs$estimate), 3), "\n")
+
+cat("\n=== CONCURRENT EFFECT (t=0) ===\n")
+cat("Estimate:", round(concurrent_coef$estimate, 3), "ms\n")
+cat("p-value:", format.pval(concurrent_coef$p.value, digits = 3), "\n")
+cat("Significant:", concurrent_coef$significant, "\n")
+
+cat("\n=== REACTIVE EFFECTS (Lags) ===\n")
+cat("Number of significant lags:", sum(reactive_coefs$significant), "/", 
+    nrow(reactive_coefs), "\n")
+cat("Mean effect size:", round(mean(reactive_coefs$estimate), 3), "ms\n")
+cat("Median effect size:", round(median(reactive_coefs$estimate), 3), "ms\n")
+cat("Range:", round(range(reactive_coefs$estimate), 3), "\n")
+
+cat("\n=== COMPARISON ===\n")
+cat("Mean absolute effect (anticipatory):", 
+    round(mean(abs(anticipatory_coefs$estimate)), 3), "ms\n")
+cat("Mean absolute effect (reactive):", 
+    round(mean(abs(reactive_coefs$estimate)), 3), "ms\n")
+
+# Find peak effect in each direction
+if (nrow(anticipatory_coefs) > 0) {
+  peak_anticipatory <- anticipatory_coefs %>% 
+    slice_max(abs(estimate), n = 1)
+  
+  cat("\n=== PEAK EFFECTS ===\n")
+  cat("Peak anticipatory effect:", round(peak_anticipatory$estimate, 3), 
+      "ms at", peak_anticipatory$lag_seconds, "seconds before boundary\n")
+  cat("  p-value:", format.pval(peak_anticipatory$p.value, digits = 3), "\n")
+}
+
+if (nrow(reactive_coefs) > 0) {
+  peak_reactive <- reactive_coefs %>% 
+    slice_max(abs(estimate), n = 1)
+  
+  cat("Peak reactive effect:", round(peak_reactive$estimate, 3), 
+      "ms at", peak_reactive$lag_seconds, "seconds after boundary\n")
+  cat("  p-value:", format.pval(peak_reactive$p.value, digits = 3), "\n")
+}
+
+# ----------------------------------------------------------------------------
+# STEP 6: Onset and Offset of Effects
+# ----------------------------------------------------------------------------
+
+sig_anticipatory <- anticipatory_coefs %>% filter(significant)
+sig_reactive <- reactive_coefs %>% filter(significant)
+
+if (nrow(sig_anticipatory) > 0) {
+  cat("\n=== ANTICIPATORY TIMING ===\n")
+  cat("Earliest anticipatory effect:", min(sig_anticipatory$lag_seconds), 
+      "seconds before boundary\n")
+  cat("Latest anticipatory effect:", max(sig_anticipatory$lag_seconds), 
+      "seconds before boundary\n")
+  cat("Duration of anticipatory window:", 
+      abs(min(sig_anticipatory$lag_seconds) - max(sig_anticipatory$lag_seconds)), 
+      "seconds\n")
+}
+
+if (nrow(sig_reactive) > 0) {
+  cat("\n=== REACTIVE TIMING ===\n")
+  cat("Earliest reactive effect:", min(sig_reactive$lag_seconds), 
+      "seconds after boundary\n")
+  cat("Latest reactive effect:", max(sig_reactive$lag_seconds), 
+      "seconds after boundary\n")
+  cat("Duration of reactive window:", 
+      max(sig_reactive$lag_seconds) - min(sig_reactive$lag_seconds), 
+      "seconds\n")
+}
+
+# ----------------------------------------------------------------------------
+# STEP 7: Cumulative Effects
+# ----------------------------------------------------------------------------
+
+cumulative_anticipatory <- sum(anticipatory_coefs$estimate)
+cumulative_reactive <- sum(reactive_coefs$estimate)
+cumulative_total <- sum(irf_coefs$estimate)
+
+cat("\n=== CUMULATIVE EFFECTS ===\n")
+cat("Total anticipatory effect:", round(cumulative_anticipatory, 3), "ms\n")
+cat("Total reactive effect:", round(cumulative_reactive, 3), "ms\n")
+cat("Total concurrent effect:", round(concurrent_coef$estimate, 3), "ms\n")
+cat("Grand total effect:", round(cumulative_total, 3), "ms\n")
+
+# Plot cumulative effects
+irf_coefs <- irf_coefs %>%
+  arrange(lag) %>%
+  mutate(cumulative = cumsum(estimate))
+
+p4 <- ggplot(irf_coefs, aes(x = lag_seconds, y = cumulative)) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_line(color = "purple", linewidth = 1.5) +
+  geom_point(aes(color = timing), size = 3) +
+  scale_color_manual(values = c(
+    "Anticipatory (Lead)" = "darkblue",
+    "Concurrent" = "black",
+    "Reactive (Lag)" = "darkgreen"
+  )) +
+  labs(
+    title = "Cumulative Impulse Response Over Time",
+    subtitle = "Running sum of effects from anticipatory through reactive window",
+    x = "Time relative to event boundary (seconds)",
+    y = "Cumulative Effect on Fixation Duration (ms)",
+    color = "Timing"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold")
+  )
+
+print(p4)
+
+# ----------------------------------------------------------------------------
+# STEP 8: Model Diagnostics
+# ----------------------------------------------------------------------------
+
+cat("\n=== MODEL FIT ===\n")
+cat("R-squared:", round(summary(model_fir)$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(summary(model_fir)$adj.r.squared, 4), "\n")
+cat("F-statistic:", round(summary(model_fir)$fstatistic[1], 2), "\n")
+cat("  p-value:", format.pval(pf(summary(model_fir)$fstatistic[1],
+                                 summary(model_fir)$fstatistic[2],
+                                 summary(model_fir)$fstatistic[3],
+                                 lower.tail = FALSE)), "\n")
+cat("Number of observations:", nobs(model_fir), "\n")
+cat("Degrees of freedom:", df.residual(model_fir), "\n")
+
+# Durbin-Watson test for autocorrelation
+dw_test <- durbinWatsonTest(model_fir)
+cat("\n=== Durbin-Watson Test (Autocorrelation Check) ===\n")
+print(dw_test)
+
+if (dw_test$dw < 1.5 | dw_test$dw > 2.5) {
+  cat("⚠️  Warning: Potential autocorrelation in residuals (DW far from 2)\n")
+  cat("   Recommendation: Use mixed-effects model or clustered SEs\n")
+}
+
+```

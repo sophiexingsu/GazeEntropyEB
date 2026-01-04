@@ -1,0 +1,570 @@
+---
+title: "Prediction_error_Gaze_Entropy"
+author: "Sophie Su"
+date: "2025-12-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(lme4)
+library(ggpubr)
+library(lmerTest)
+```
+
+## Load Data
+```{r load the data}
+master<-read_csv("../Data/ALL_temporal_multilag_results_t1.csv")
+gaze_isc<-read_csv("../Data/frame_level_group_ISC_restricted_sampled.csv")%>%
+    mutate(movie = sub("\\.mp4$", "", movie))
+gaze_isc_full<-read_csv("../Data/frame_level_group_ISC_all_movies.csv")%>%
+   mutate(movie = sub("\\.mp4$", "", movie))%>%
+  rename(mean_isc_sm=mean_isc)
+
+gaze_similarity_all <- read_csv("../Data/gaze_similarity.csv")
+
+master<-master%>%
+  left_join(gaze_isc,by = c("movie","frame"))
+gaze_isc_full <- gaze_isc_full %>%
+  mutate(
+    movie = as.character(movie),
+    frame = as.numeric(frame)
+  )
+
+master <- master %>%
+  mutate(
+    movie = as.character(movie),
+    frame = as.numeric(frame)
+    
+  )
+
+saccades_fixation <- read.csv("../Data/FRAME_LEVEL_EYE_METRICS.csv")
+saccades_fixation_participants<-read_csv("../Data/FRAME_LEVEL_EYE_METRICS_BySubJ.csv")
+```
+
+
+## downsample the data more apporotaitesly
+```{r data_transformation}
+
+downsample_to_master <- function(source_df, target_df,
+                                  frame_var = "frame") {
+
+  out_list <- list()
+
+  for (m in unique(target_df$movie)) {
+
+    src_m <- source_df %>%
+      filter(movie == m) %>%
+      arrange(.data[[frame_var]])
+
+    tgt_m <- target_df %>%
+      dplyr::filter(movie == m) %>%
+      arrange(.data[[frame_var]])
+
+    src_frames <- src_m[[frame_var]]
+    tgt_frames <- tgt_m[[frame_var]]
+
+    # --- Adaptive midpoints ---
+    cuts <- c(
+      -Inf,
+      (head(tgt_frames, -1) + tail(tgt_frames, -1)) / 2,
+      Inf
+    )
+
+    # --- Assign each source row to nearest target frame ---
+    src_m <- src_m %>%
+      mutate(
+        target_frame = tgt_frames[
+          findInterval(.data[[frame_var]], cuts)
+        ]
+      )
+
+    # --- Average into target frames ---
+    agg_m <- src_m %>%
+      group_by(movie, target_frame) %>%
+      summarise(
+        across(
+          where(is.numeric) & !all_of(frame_var),
+          ~ mean(.x, na.rm = TRUE)
+        ),
+        .groups = "drop"
+      ) %>%
+      rename(frame = target_frame)   # now ONLY one frame column
+
+    out_list[[m]] <- agg_m
+  }
+
+  bind_rows(out_list)
+}
+# ================================
+# APPLY DOWNSAMPLING A#
+# Down sampling by averaging to the nearest frame
+# ================================
+
+gaze_isc_ds <- downsample_to_master(
+  source_df = gaze_isc_full,
+  target_df = master,
+  frame_var = "frame"
+)
+
+
+gaze_similarity_all_ds <- downsample_to_master(
+  source_df = gaze_similarity_all,
+  target_df = master,
+  frame_var = "frame"
+)
+
+
+master <- master %>%
+  left_join(
+    gaze_isc_ds,
+    by = c("movie", "frame")
+  )
+master <- master %>%
+  left_join(
+    gaze_similarity_all_ds,
+    by = c("movie", "frame")
+  )
+  
+```
+## Load SEM PE and SEM Uncertainty 
+```{r rem}
+saccades_fixation <- saccades_fixation %>%
+  mutate(calc_frame = as.integer(round(calc_frame)))
+
+metrics <- c(
+  "mean_fix_dur_ms",
+  "mean_sacc_dur_ms",
+  "mean_sacc_amp_px",
+  "mean_sacc_amp_deg"
+)
+
+
+# ================================
+# SMOOTHING FUNCTION (SAFE VERSION)
+# ================================
+
+smooth_metric <- function(df, value_col, bw = 120) {
+
+  df2 <- df %>%
+    filter(!is.na(.data[[value_col]])) %>%
+    arrange(calc_frame)
+
+  if (nrow(df2) < 10) return(rep(NA_real_, nrow(df)))
+
+  sm <- ksmooth(
+    x = df2$calc_frame,
+    y = df2[[value_col]],
+    kernel = "normal",
+    bandwidth = bw,
+    x.points = df$calc_frame
+  )
+
+  as.numeric(sm$y)
+}
+
+# ================================
+# APPLY SMOOTHING BY MOVIE
+# ================================
+
+saccades_smoothed <- saccades_fixation %>%
+  group_by(movie) %>%
+  arrange(calc_frame, .by_group = TRUE) %>%
+  mutate(
+    fix_dur_sm      = smooth_metric(cur_data(), "mean_fix_dur_ms"),
+    sacc_dur_sm     = smooth_metric(cur_data(), "mean_sacc_dur_ms"),
+    sacc_amp_px_sm  = smooth_metric(cur_data(), "mean_sacc_amp_px"),
+    sacc_amp_deg_sm = smooth_metric(cur_data(), "mean_sacc_amp_deg"),
+  ) %>%
+  ungroup()
+
+
+saccades_smoothed_participants <- saccades_fixation_participants %>%
+  group_by(subject, movie) %>%
+  arrange(calc_frame, .by_group = TRUE) %>%
+  mutate(
+    fix_dur_sm      = smooth_metric(cur_data(), "mean_fix_dur_ms"),
+    sacc_dur_sm     = smooth_metric(cur_data(), "mean_sacc_dur_ms"),
+    sacc_amp_px_sm  = smooth_metric(cur_data(), "mean_sacc_amp_px"),
+    sacc_amp_deg_sm = smooth_metric(cur_data(), "mean_sacc_amp_deg"),
+  ) %>%
+  ungroup()
+
+saccades_fixation_participants <- saccades_fixation_participants %>%
+  mutate(movie = sub("\\.mp4$", "", movie))
+# ================================
+# FINAL MERGE INTO MASTER
+# ================================
+saccades_smoothed <- saccades_smoothed %>%
+  mutate(movie = sub("\\.mp4$", "", movie))
+
+master <- master %>%
+  left_join(
+    saccades_smoothed %>%
+      select(movie, calc_frame,
+             fix_dur_sm,
+             sacc_dur_sm,
+             sacc_amp_px_sm,
+             sacc_amp_deg_sm,
+             #isc_mean_sm
+             ),
+    by = c("movie" = "movie", "frame" = "calc_frame")
+  )
+# ================================
+# FINAL SANITY CHECKS
+# ================================
+
+cat("\n--- MERGE CHECK ---\n")
+print(summary(master$fix_dur_sm))
+print(summary(master$sacc_amp_px_sm))
+#print(summary(master$isc_mean))
+
+cat("\n--- NA COUNTS ---\n")
+print(colMeans(is.na(master[, c(
+  "fix_dur_sm",
+  "sacc_dur_sm",
+  "sacc_amp_px_sm",
+  "sacc_amp_deg_sm"
+)])))
+
+SEM_PE <- data.frame()
+sem_data_dir <- "~/Downloads/movie_segmentation_stats/"
+frame_rate <- 59.9  # adjust if different
+
+# Process PE data
+for(i in list.files(sem_data_dir, pattern = "*trim_pe.csv")) {
+  temp <- read.csv(paste0(sem_data_dir, "/", i)) %>%
+    mutate(Movie = substr(i, start = 1, stop = 5),
+           sem_pe = pe,
+           frame = round(time.s. * frame_rate)) %>%
+    dplyr::select(frame, sem_pe, Movie)
+  
+  # Extract movie index and convert to master format
+  index <- substr(gsub("\\.", "", i), 1, 3)
+  movie_id <- paste(substr(index, 1, 1), substr(index, 2, 2), substr(index, 3, 3), sep = ".")
+  
+  # Get frames from master for this specific movie
+  master_frames <- master %>% 
+    filter(movie == movie_id) %>% 
+    pull(frame) %>% 
+    unique()
+  
+  # Smooth and sample at master's frames
+  temp_sampled <- data.frame(
+    frame = master_frames, 
+    sem_pe = ksmooth(temp$frame, temp$sem_pe, 
+                     bandwidth = 120, 
+                     x.points = master_frames)$y, 
+    movie = movie_id
+  )
+  
+  SEM_PE <- rbind(SEM_PE, temp_sampled)
+}
+
+# Process Uncertainty data
+SEM_uncertainty <- data.frame()
+for(i in list.files(sem_data_dir, pattern = "*trim_uncertainty.csv")) {
+  temp <- read.csv(paste0(sem_data_dir, "/", i)) %>%
+    mutate(Movie = substr(i, start = 1, stop = 5),
+           sem_uncertainty = uncertainty,
+           frame = round(time.s. * frame_rate)) %>%
+    dplyr::select(frame, sem_uncertainty, Movie)
+  
+  # Extract movie index and convert to master format
+  index <- substr(gsub("\\.", "", i), 1, 3)
+  movie_id <- paste(substr(index, 1, 1), substr(index, 2, 2), substr(index, 3, 3), sep = ".")
+  
+  # Get frames from master for this specific movie
+  master_frames <- master %>% 
+    filter(movie == movie_id) %>% 
+    pull(frame) %>% 
+    unique()
+  
+  # Smooth and sample at master's frames
+  temp_sampled <- data.frame(
+    frame = master_frames, 
+    sem_uncertainty = ksmooth(temp$frame, temp$sem_uncertainty, 
+                              bandwidth = 180, 
+                              x.points = master_frames)$y, 
+    movie = movie_id
+  )
+  
+  SEM_uncertainty <- rbind(SEM_uncertainty, temp_sampled)
+}
+
+# Merge everything into master
+master <- master %>%
+  left_join(SEM_PE, by = c("movie" = "movie", "frame" = "frame")) %>%
+  left_join(SEM_uncertainty, by = c("movie" = "movie", "frame" = "frame"))
+
+seg_des<-read.csv("~/Library/CloudStorage/Box-Box/DCL_ARCHIVE/Documents/Events/exp159_EyetrackingSEM/Analysis/segmentation_probability_sampled.csv") #JZ relative paths
+seg_des %<>% 
+  #dplyr::filter(Movie=="1.2.3_C1_trim")%>%
+  mutate(frame=round(Time*frame_rate))%>%
+  mutate(Movie=gsub("_C1_trim", "", Movie))%>%
+  mutate(eid=paste(frame, Movie))%>%
+  rename(probability=Segmentation_Prob)%>%
+  dplyr::select("frame", "probability","Condition","eid","Movie")
+seg_aligned <- seg_des %>%
+  group_by(Movie, Condition) %>%
+  arrange(frame) %>%
+  # Get the frame range for this movie from master
+  group_modify(~ {
+    movie_id <- .y$Movie
+    condition <- .y$Condition
+    
+    # Get frames from master for this movie
+    master_frames <- master %>%
+      filter(movie == movie_id) %>%
+      pull(frame) %>%
+      unique() %>%
+      sort()
+    
+    # Smooth and interpolate at master's frames
+    if (nrow(.x) > 1) {
+      smoothed <- ksmooth(
+        x = .x$frame,
+        y = .x$probability,
+        kernel = "normal",
+        bandwidth = 120,  # Same as before - adjust if needed
+        x.points = master_frames
+      )
+      
+      tibble(
+        frame = smoothed$x,
+        probability = smoothed$y
+      )
+    } else {
+      tibble(frame = master_frames, probability = NA)
+    }
+  }) %>%
+  ungroup()
+
+# Pivot to wide format (separate columns for each condition)
+seg_wide <- seg_aligned %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = probability,
+    names_prefix = "seg_prob_"
+  )
+
+# Merge with master
+master <- master %>%
+  left_join(seg_wide, by = c("movie" = "Movie", "frame" = "frame"))
+## Participants level aggregation 
+saccades_smoothed_participants <- saccades_smoothed_participants %>%
+  mutate(movie = sub("\\.mp4$", "", movie))
+
+participant_master <- saccades_smoothed_participants %>%
+  left_join(
+    master,
+    by = c(
+      "movie" = "movie",
+      "calc_frame" = "frame"
+    )
+  )
+write_csv(participant_master,"../Data/participant_master_gaze_entropy.csv")
+write_csv(master, "../Data/master_gaze_entropy.csv")
+```
+## Build Linear Regression Models to Understand the relationship bewteen Gaze Entropy, Subject Similarity, SEM-PE,SEM-UNCERTAINTY, and Segmentation Probability
+```{r all_the_relationship}
+#master
+m_coarse_seg_prob<- lmer(
+  seg_prob_coarse~ gaze_entropy+ (1| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_coarse_seg_prob)
+m_coarse_seg_prob_fix<- lmer(
+  seg_prob_coarse~ fix_dur_sm+ (1| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_coarse_seg_prob_fix)
+m_coarse_seg_prob_sacc<-lmer( 
+   seg_prob_coarse~ sacc_amp_deg_sm+ (1| movie),
+  data = master,
+  REML = FALSE
+) 
+summary(m_coarse_seg_prob_sacc)
+m_entropy_fix<- lmer(
+  gaze_entropy~ fix_dur_sm+ (1+fix_dur_sm| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_entropy_fix)
+m_entropy_sacc<- lmer(
+  gaze_entropy~ sacc_amp_px_sm +(1| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_entropy_sacc)
+
+m_entropy_uncertainty<- lmer(
+  gaze_entropy~ sem_uncertainty +(1+sem_uncertainty| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_entropy_uncertainty)
+m_pe<- lmer(
+  gaze_entropy~ sem_pe+ (1+sem_pe | movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_pe)
+```
+
+### What is the relationship between Gaze entropy and ISC and Gaze Similarity 
+
+### expecitaed signinfantna negiative relationshp, teh higher the entorpy the lower the gaze similaries and the isc
+```{r additional_analysis}
+m_isc<- lmer(
+  gaze_entropy~ mean_isc_sm+ (1+mean_isc_sm| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_isc)
+
+m_similarity<- lmer(
+  gaze_entropy~ gaze_similarity_per_frame+ (1+gaze_similarity_per_frame| movie),
+  data = master,
+  REML = FALSE
+)
+summary(m_similarity)
+```
+
+## More visualization than needed 
+```{r}
+master_trimmed <- master %>%
+  group_by(movie) %>%
+  arrange(frame, .by_group = TRUE) %>%
+  slice((50 + 1):(n() - 50)) %>%
+  ungroup()
+
+# 1. Put all the relevant variables into long format and z-score within movie × metric
+vars_to_plot <- c(
+    "seg_prob_fine",
+    "isc_mean_sm"
+)
+
+master_long <- master_trimmed %>%
+    select(movie, frame, all_of(vars_to_plot)) %>%
+    pivot_longer(
+        cols = all_of(vars_to_plot),
+        names_to = "metric",
+        values_to = "value"
+    ) %>%
+    group_by(movie, metric) %>%
+    mutate(
+        value_z = as.numeric(scale(value))
+    ) %>%
+    ungroup()
+
+# 2. Plot by FRAME on x-axis, all metrics overlaid (z-scored) by movie
+master_long %>%
+    ggplot(aes(x = frame, y = value_z, colour = metric)) +
+    geom_line(alpha = 0.7) +
+    facet_wrap(~ movie, scales = "free_x") +
+    labs(
+        x = "Frame",
+        y = "Z-scored value within movie × metric",
+        title = "Semantic Uncertainty and Eye-movement Metrics Over Time",
+        colour = "Metric"
+    ) +
+    theme_minimal()
+```
+
+### another way to calculate the relationshiop 
+```{r}
+vars_to_plot <- c(
+    "seg_prob_fine",
+    "gaze_similarity_per_frame"
+)
+
+master_long <- master_trimmed %>%
+    select(movie, frame, all_of(vars_to_plot)) %>%
+    pivot_longer(
+        cols = all_of(vars_to_plot),
+        names_to = "metric",
+        values_to = "value"
+    ) %>%
+    group_by(movie, metric) %>%
+    mutate(
+        value_z = as.numeric(scale(value))
+    ) %>%
+    ungroup()
+
+# 2. Plot by FRAME on x-axis, all metrics overlaid (z-scored) by movie
+master_long %>%
+    ggplot(aes(x = frame, y = value_z, colour = metric)) +
+    geom_line(alpha = 0.7) +
+    facet_wrap(~ movie, scales = "free_x") +
+    labs(
+        x = "Frame",
+        y = "Z-scored value within movie × metric",
+        title = "gaze_similarity_per_frame and Eye-movement Metrics Over Time",
+        colour = "Metric"
+    ) +
+    theme_minimal()
+```
+
+## Understanding the relationship bewteen prediction error
+```{r visualization-of-the-relationship}
+master_trimmed  %>%
+    ggplot(aes(x =  sem_uncertainty, y = gaze_entropy)) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~ movie, scales = "free") +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+    labs(
+        x = "SEM Ucertaity",
+        y = "Gaze Entropy",
+        title = "Correlation Between Semantic Prediction Error and Gaze Entropy Across Movies"
+    ) +
+    theme_minimal()
+
+
+
+
+master %>%
+    ggplot(aes(x =  sem_pe, y = gaze_entropy)) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~ movie, scales = "free") +
+    stat_cor(method = "pearson", label.x.npc = "left", label.y.npc = "top") +
+    labs(
+        x = "SEM Ucertaity",
+        y = "Gaze Entropy",
+        title = "Correlation Between Semantic Prediction Error and Gaze Entropy Across Movies"
+    ) +
+    theme_minimal()
+
+m_uncertainty <- lmer(
+  gaze_entropy~ sem_uncertainty+ (1+sem_uncertainty | movie),
+  data = master,
+  REML = FALSE
+)
+
+m_pe<- lmer(
+  gaze_entropy~ sem_pe+ (1+sem_pe | movie),
+  data = master,
+  REML = FALSE
+)
+
+summary(m_pe)
+summary(m_uncertainty)
+
+m_fine_seg_prob<- lmer(
+  gaze_entropy~ seg_prob_fine+ (1+seg_prob_fine| movie),
+  data = master,
+  REML = FALSE
+)
+
+m_coarse_seg_prob<- lmer(
+  gaze_entropy~ seg_prob_coarse+ (1+seg_prob_coarse| movie),
+  data = master,
+  REML = FALSE
+)
+```

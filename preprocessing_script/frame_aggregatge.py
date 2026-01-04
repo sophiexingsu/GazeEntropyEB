@@ -3,9 +3,9 @@ import numpy as np
 from pathlib import Path
 
 # ============================================================
-# CONFIG
+# CONFIG 
+# this is the script that take the output fromt eh processing for the futer analysis to calculate the fixation dufrration dan station anmiples 
 # ============================================================
-
 FIX_PATH  = "event_level_outputs/ALL_fixations.csv"
 SACC_PATH = "event_level_outputs/ALL_saccades.csv"
 
@@ -20,7 +20,7 @@ MIN_SUBJECTS_PER_FRAME = 0    # safety threshold
 # LOAD DATA
 # ============================================================
 
-print("\n✅ Loading fixation and saccade files...")
+print("\n Loading fixation and saccade files...")
 
 fix  = pd.read_csv(FIX_PATH)
 sacc = pd.read_csv(SACC_PATH)
@@ -34,7 +34,7 @@ print("Sacc subjects:", sacc["subject"].nunique())
 # HARD EXCLUSION OF BAD SUBJECTS (NO FRAME ALIGNMENT)
 # ============================================================
 
-print("\n🚨 Removing subjects with missing frame alignment...")
+print("\n Removing subjects with missing frame alignment...")
 
 bad_fix_subs = set(
     fix.loc[fix["calc_frame"].isna() | fix["ms_video"].isna(), "subject"]
@@ -51,13 +51,13 @@ print("Subjects removed:", bad_subjects)
 fix_clean  = fix[~fix["subject"].isin(bad_subjects)].copy()
 sacc_clean = sacc[~sacc["subject"].isin(bad_subjects)].copy()
 
-print("✅ Subjects retained:", fix_clean["subject"].nunique())
+print(" Subjects retained:", fix_clean["subject"].nunique())
 
 # ============================================================
 # REMOVE SPARSE FRAMES (PREVENT BOUNDARY BIAS)
 # ============================================================
 
-print("\n✅ Removing sparse frames...")
+print("\nRemoving sparse frames...")
 
 fix_counts = (
     fix_clean

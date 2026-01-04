@@ -1,0 +1,663 @@
+---
+title: "FIR_Model_fitting_for_publication"
+author: "Sophie Su"
+date: "2026-01-04"
+output: html_document
+---
+## Data Loading & Filtering
+```{r setup, include=FALSE}
+# ============================================================
+# Eisenberg & Zacks (2016) Style FIR Model
+# Binary Event Boundaries | ±10 s Window | Mixed Effects
+# ============================================================
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(lmerTest)
+library(broom.mixed)
+library(tidyverse)
+library(ggplot2)
+library(car)
+master<-read.csv("../Data/master_gaze_entropy.csv")
+participant_master<-read_csv("../Data/participant_master_gaze_entropy.csv")
+median_boundary_counts <- data.frame(
+  movie = c("1.2.3", "2.4.1", "3.1.3", "6.3.9"),
+  median_coarse_count = c(10, 9, 7, 8),
+  median_fine_count = c(21, 35, 32, 29),
+  duration = c(586.112, 645.824, 585.984, 679.488)
+) ## these were from Yining's dataset
+find_peaks <- function(x, threshold = 0.01) {
+  n <- length(x)
+  if (n < 3) return(rep(FALSE, n))
+  
+  # A peak is where x[i] > x[i-1] AND x[i] > x[i+1]
+  peaks <- c(FALSE, x[2:(n-1)] > x[1:(n-2)] & x[2:(n-1)] > x[3:n], FALSE)
+  
+  # Filter out very small peaks
+  peaks <- peaks & (x > threshold)
+  
+  return(peaks)
+}
+
+# Function to select top N peaks
+select_top_n_peaks <- function(seg_prob, n_boundaries) {
+  # Find all peaks
+  is_peak <- find_peaks(seg_prob)
+  
+  # Get indices and values of peaks
+  peak_indices <- which(is_peak)
+  peak_values <- seg_prob[peak_indices]
+  
+  if (length(peak_indices) == 0) {
+    # No peaks found, return all zeros
+    return(rep(0, length(seg_prob)))
+  }
+  
+  # Sort peaks by value (descending) and select top N
+  sorted_order <- order(peak_values, decreasing = TRUE)
+  n_to_select <- min(n_boundaries, length(peak_indices))
+  top_peak_indices <- peak_indices[sorted_order[1:n_to_select]]
+  
+  # Create binary vector: 1 for selected peaks, 0 otherwise
+  selected_peaks <- rep(0, length(seg_prob))
+  selected_peaks[top_peak_indices] <- 1
+  
+  return(selected_peaks)
+}
+
+# ============================================================
+# STEP 3: CREATE PEAK-BASED BOUNDARIES FOR BOTH FINE & COARSE
+# ============================================================
+
+master <- master %>%
+  left_join(median_boundary_counts, by = "movie")
+
+# Create boundaries per movie
+master <- master %>%
+  group_by(movie) %>%
+  arrange(frame) %>%
+  mutate(
+    # Coarse boundaries
+    seg_boundary_bin_coarse = select_top_n_peaks(
+      seg_prob_coarse, 
+      first(median_coarse_count)
+    ),
+    # Fine boundaries
+    seg_boundary_bin_fine = select_top_n_peaks(
+      seg_prob_fine, 
+      first(median_fine_count)
+    )
+  ) %>%
+  ungroup()
+
+downsample_to_master <- function(source_df, target_df,
+                                 frame_var = "calc_frame",
+                                 target_frame_var = "frame",
+                                 id_vars = c("subject", "movie"),
+                                 sum_vars = c("n_fix", "n_sacc"),
+                                 drop_frames_below_0 = TRUE) {
+  stopifnot(all(c("movie", frame_var) %in% names(source_df)))
+  stopifnot(all(c("movie", target_frame_var) %in% names(target_df)))
+  stopifnot(all(id_vars %in% names(source_df)))
+
+  # Optional: drop weird negative frames (like -1) before mapping
+  if (drop_frames_below_0) {
+    source_df <- source_df %>% dplyr::filter(.data[[frame_var]] >= 0)
+  }
+
+  out_list <- vector("list", length(unique(target_df$movie)))
+  names(out_list) <- unique(target_df$movie)
+
+  for (m in unique(target_df$movie)) {
+
+    src_m <- source_df %>%
+      dplyr::filter(movie == m) %>%
+      dplyr::arrange(.data[[frame_var]])
+
+    tgt_m <- target_df %>%
+      dplyr::filter(movie == m) %>%
+      dplyr::arrange(.data[[target_frame_var]])
+
+    if (nrow(src_m) == 0 || nrow(tgt_m) == 0) next
+
+    tgt_frames <- tgt_m[[target_frame_var]]
+
+    # Midpoint cuts define Voronoi bins around target frames
+    cuts <- c(
+      -Inf,
+      (head(tgt_frames, -1) + tail(tgt_frames, -1)) / 2,
+      Inf
+    )
+
+    # Map each source row to the nearest target frame
+    src_m <- src_m %>%
+      dplyr::mutate(
+        target_frame = tgt_frames[findInterval(.data[[frame_var]], cuts)]
+      )
+
+    # Decide which numeric columns to average
+    numeric_cols <- names(src_m)[vapply(src_m, is.numeric, logical(1))]
+    avg_cols <- setdiff(numeric_cols, c(frame_var, "target_frame", sum_vars))
+
+    # Aggregate within SUBJECT × MOVIE × TARGET_FRAME
+    agg_m <- src_m %>%
+      dplyr::group_by(dplyr::across(dplyr::all_of(id_vars)), target_frame) %>%
+      dplyr::summarise(
+        dplyr::across(dplyr::all_of(avg_cols), ~ mean(.x, na.rm = TRUE)),
+        dplyr::across(dplyr::all_of(intersect(sum_vars, names(src_m))), ~ sum(.x, na.rm = TRUE)),
+        .groups = "drop"
+      ) %>%
+      dplyr::rename(!!target_frame_var := target_frame)
+
+    out_list[[m]] <- agg_m
+  }
+
+  dplyr::bind_rows(out_list)
+}
+participant_aligned <- downsample_to_master(
+  source_df = participant_master,
+  target_df = master,
+  frame_var = "calc_frame",
+  target_frame_var = "frame",
+  id_vars = c("subject", "movie"),
+  sum_vars = c("n_fix", "n_sacc"),
+  drop_frames_below_0 = TRUE
+)
+participant_aligned <- participant_aligned %>%
+  mutate(
+    movie = sub("\\.mp4$", "", movie)
+  ) %>%
+  left_join(
+    master %>%
+      select(
+        movie, frame,
+        seg_boundary_bin_coarse, seg_boundary_bin_fine
+      ),
+    by = c("movie", "frame")
+  )
+
+# ============================================================
+# STEP 4: DIAGNOSTICS FOR BOTH BOUNDARY TYPES
+# ============================================================
+
+cat("=== COARSE BOUNDARY SUMMARY (PEAK-BASED) ===\n")
+coarse_summary <- master %>%
+  group_by(movie) %>%
+  summarise(
+    target_count = first(median_coarse_count),
+    actual_count = sum(seg_boundary_bin_coarse, na.rm = TRUE),
+    duration_sec = first(duration),
+    boundaries_per_min = actual_count / (duration_sec / 60),
+    proportion = mean(seg_boundary_bin_coarse, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(coarse_summary)
+
+cat("\n=== FINE BOUNDARY SUMMARY (PEAK-BASED) ===\n")
+fine_summary <- master %>%
+  group_by(movie) %>%
+  summarise(
+    target_count = first(median_fine_count),
+    actual_count = sum(seg_boundary_bin_fine, na.rm = TRUE),
+    duration_sec = first(duration),
+    boundaries_per_min = actual_count / (duration_sec / 60),
+    proportion = mean(seg_boundary_bin_fine, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(fine_summary)
+
+cat("\n=== OVERALL PROPORTIONS ===\n")
+cat("Coarse boundaries:", 
+    round(mean(master$seg_boundary_bin_coarse, na.rm = TRUE), 4), "\n")
+cat("Fine boundaries:", 
+    round(mean(master$seg_boundary_bin_fine, na.rm = TRUE), 4), "\n")
+
+```
+## Model-Fitting Gaze Entropy FIR model for the Event Boundaries
+```{r model-fitting1}
+# ============================================================
+# STEP 2: CREATE ±10  SECOND FIR PREDICTORS (21 TOTAL)
+# Paper: separate shifted binary predictors
+# ============================================================
+MIN_LAG <- -10
+MAX_LAG <-  10
+
+create_fir_paper_style <- function(df, var, min_lag, max_lag) {
+  df <- df %>%
+    arrange(movie, frame) %>%
+    group_by(movie)
+  
+  for (k in min_lag:max_lag) {
+    cname <- paste0(var, "_t", ifelse(k >= 0, paste0("+", k), k))
+    
+    if (k < 0) {
+      df <- df %>% mutate(!!cname := lead(.data[[var]], abs(k)))
+    } else if (k == 0) {
+      df <- df %>% mutate(!!cname := .data[[var]])
+    } else {
+      df <- df %>% mutate(!!cname := lag(.data[[var]], k))
+    }
+  }
+  
+  df %>% ungroup()
+}
+
+master_fir <- create_fir_paper_style(
+  master,
+  "seg_boundary_bin_coarse",
+  MIN_LAG,
+  MAX_LAG
+)
+master_fir$gaze_similarity=master_fir$gaze_similarity_per_frame
+fir_cols <- names(master_fir)[grepl("seg_boundary_bin_coarse_t", names(master_fir))]
+
+master_fir <- master_fir %>%
+  filter(complete.cases(select(., all_of(fir_cols))))
+
+# ============================================================
+# STEP 3: FIT FULL & REDUCED MIXED MODELS (OMNIBUS TEST)
+# Paper used random effects for MOVIE (+ SUBJECT originally)
+# ============================================================
+
+fir_terms <- paste0("`", fir_cols, "`")
+
+full_formula <- as.formula(
+  paste(
+    "gaze_entropy ~",
+    paste(fir_terms, collapse = " + "),
+    "+ (1 | movie)"
+  )
+)
+
+reduced_formula <- as.formula(
+  "gaze_entropy ~ (1 | movie)"
+)
+
+m_full <- lmer(full_formula, data = master_fir, REML = FALSE)
+m_reduced <- lmer(reduced_formula, data = master_fir, REML = FALSE)
+
+cat("\n=== OMNIBUS TEST ===\n")
+print(anova(m_reduced, m_full))
+
+# ============================================================
+# STEP 4: EXTRACT IRF (DEVIATION FROM BASELINE)
+# ============================================================
+
+irf <- tidy(m_full, effects = "fixed") %>%
+  filter(grepl("seg_boundary_bin_coarse_t", term)) %>%
+  mutate(
+    term_clean = gsub("`", "", term),            # ✅ remove backticks
+    lag = as.integer(gsub(".*_t", "", term_clean)),  # ✅ keeps sign (±)
+    lag_seconds = lag,
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+print(irf, n = Inf)
+
+# ============================================================
+# STEP 5: PLOT PAPER-STYLE IRF
+# ============================================================
+
+p_entropy_Coarse_EB<-ggplot(irf, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(color = significant), size = 3) +
+  scale_color_manual(values = c("TRUE" = "darkred", "FALSE" = "gray50")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) +
+  labs(
+    title = "FIR:CoarseEvent Boundary → gaze_entropy",
+    subtitle = "Each point = deviation from baseline (±10 s window)",
+    x = "Time relative to boundary (seconds)",
+    y = "Effect on gaze_entropy",
+    color = "p < .05"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# STEP 6: ANTICIPATORY VS REACTIVE WINDOWS (AS IN PAPER)
+# ============================================================
+
+anticipatory <- irf %>% filter(lag < 0)
+reactive      <- irf %>% filter(lag > 0)
+
+cat("\nANTICIPATORY significant:", sum(anticipatory$significant), "\n")
+cat("REACTIVE significant:", sum(reactive$significant), "\n")
+
+p_entropy_Coarse_EB
+```
+
+## Model-Fitting Fixation-Duration FIR model for the Event Boundaries 
+```{r model-fitting2}
+# ============================================================
+# STEP 3: FIT FULL & REDUCED MIXED MODELS (OMNIBUS TEST)
+# ============================================================
+
+fir_terms <- paste0("`", fir_cols, "`")
+
+full_formula <- as.formula(
+  paste(
+    "fix_dur_sm~",
+    paste(fir_terms, collapse = " + "),
+    "+ (1 | movie)"
+  )
+)
+
+reduced_formula <- as.formula(
+  "fix_dur_sm ~ (1 | movie)"
+)
+
+m_full <- lmer(full_formula, data = master_fir, REML = FALSE)
+m_reduced <- lmer(reduced_formula, data = master_fir, REML = FALSE)
+
+cat("\n=== OMNIBUS TEST ===\n")
+print(anova(m_reduced, m_full))
+
+# ============================================================
+# STEP 4: EXTRACT IRF (DEVIATION FROM BASELINE)
+# ============================================================
+
+irf <- tidy(m_full, effects = "fixed") %>%
+  filter(grepl("seg_boundary_bin_coarse_t", term)) %>%
+  mutate(
+    term_clean = gsub("`", "", term),            # ✅ remove backticks
+    lag = as.integer(gsub(".*_t", "", term_clean)),  # ✅ keeps sign (±)
+    lag_seconds = lag,
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+print(irf, n = Inf)
+
+# ============================================================
+# STEP 5: PLOT PAPER-STYLE IRF
+# ============================================================
+
+p_fixdur_Coarse_EB <-ggplot(irf, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(color = significant), size = 3) +
+  scale_color_manual(values = c("TRUE" = "darkred", "FALSE" = "gray50")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) +
+  labs(
+    title = "FIR:CoarseEvent Boundary → fix_dur_sm",
+    subtitle = "Each point = deviation from baseline (±10 s window)",
+    x = "Time relative to boundary (seconds)",
+    y = "Effect onfix_dur_sm",
+    color = "p < .05"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# STEP 6: ANTICIPATORY VS REACTIVE WINDOWS (AS IN PAPER)
+# ============================================================
+
+anticipatory <- irf %>% filter(lag < 0)
+reactive      <- irf %>% filter(lag > 0)
+
+cat("\nANTICIPATORY significant:", sum(anticipatory$significant), "\n")
+cat("REACTIVE significant:", sum(reactive$significant), "\n")
+p_fixdur_Coarse_EB
+```
+
+## Model-Fitting Saccade Amplitude FIR model for the Event Boundaries
+```{r test_new}
+# ============================================================
+# STEP 3: FIT FULL & REDUCED MIXED MODELS (OMNIBUS TEST)
+# ============================================================
+
+fir_terms <- paste0("`", fir_cols, "`")
+
+full_formula <- as.formula(
+  paste(
+    "sacc_amp_px_sm~",
+    paste(fir_terms, collapse = " + "),
+    "+ (1 | movie)"
+  )
+)
+
+reduced_formula <- as.formula(
+  "sacc_amp_px_sm ~ (1 | movie)"
+)
+
+m_full <- lmer(full_formula, data = master_fir, REML = FALSE)
+m_reduced <- lmer(reduced_formula, data = master_fir, REML = FALSE)
+
+cat("\n=== OMNIBUS TEST ===\n")
+print(anova(m_reduced, m_full))
+
+# ============================================================
+# STEP 4: EXTRACT IRF (DEVIATION FROM BASELINE)
+# ============================================================
+
+irf <- tidy(m_full, effects = "fixed") %>%
+  filter(grepl("seg_boundary_bin_coarse_t", term)) %>%
+  mutate(
+    term_clean = gsub("`", "", term),            # ✅ remove backticks
+    lag = as.integer(gsub(".*_t", "", term_clean)),  # ✅ keeps sign (±)
+    lag_seconds = lag,
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+print(irf, n = Inf)
+
+# ============================================================
+# STEP 5: PLOT PAPER-STYLE IRF
+# ============================================================
+
+p_SaccAmp_Coarse_EB<-ggplot(irf, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(color = significant), size = 3) +
+  scale_color_manual(values = c("TRUE" = "darkred", "FALSE" = "gray50")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) +
+  labs(
+    title = "FIR:CoarseEvent Boundary → Saccade Amplitudes",
+    subtitle = "Each point = deviation from baseline (±10 s window)",
+    x = "Time relative to boundary (seconds)",
+    y = "Effect on Saccade Amplitudes",
+    color = "p < .05"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# STEP 6: ANTICIPATORY VS REACTIVE WINDOWS (AS IN PAPER)
+# ============================================================
+
+anticipatory <- irf %>% filter(lag < 0)
+reactive      <- irf %>% filter(lag > 0)
+
+cat("\nANTICIPATORY significant:", sum(anticipatory$significant), "\n")
+cat("REACTIVE significant:", sum(reactive$significant), "\n")
+p_SaccAmp_Coarse_EB
+```
+
+## Participant Level Model-Fitting Fixation Duration
+```{r individual_level}
+participant_aligned <- participant_aligned %>%
+  mutate(
+    movie = as.character(movie),
+    subject = as.character(subject)
+  )
+create_fir_paper_style_subject <- function(df, var, min_lag, max_lag) {
+  df <- df %>%
+    arrange(subject, movie, frame) %>%
+    group_by(subject, movie)
+  
+  for (k in min_lag:max_lag) {
+    cname <- paste0(var, "_t", ifelse(k >= 0, paste0("+", k), k))
+    
+    if (k < 0) {
+      df <- df %>% mutate(!!cname := lead(.data[[var]], abs(k)))
+    } else if (k == 0) {
+      df <- df %>% mutate(!!cname := .data[[var]])
+    } else {
+      df <- df %>% mutate(!!cname := lag(.data[[var]], k))
+    }
+  }
+  
+  df %>% ungroup()
+}
+
+master_fir_subj <- create_fir_paper_style_subject(
+  participant_aligned,
+  "seg_boundary_bin_coarse",
+  MIN_LAG,
+  MAX_LAG
+)
+
+fir_cols <- names(master_fir_subj)[grepl("seg_boundary_bin_coarse_t", names(master_fir_subj))]
+
+# Trim rows that don't have a full FIR window WITHIN subject × movie
+master_fir_subj <- master_fir_subj %>%
+  filter(complete.cases(select(., all_of(fir_cols))))
+fir_terms <- paste0("`", fir_cols, "`")
+
+full_formula_movie_subject <- as.formula(
+  paste(
+    "mean_fix_dur_ms ~",
+    paste(fir_terms, collapse = " + "),
+    "+ (1 | movie) + (1 | subject)"
+  )
+)
+
+reduced_movie_subject <- as.formula("mean_fix_dur_ms ~ (1 | movie) + (1 | subject)")
+
+m_full_ms <- lmer(full_formula_movie_subject, data = master_fir_subj, REML = FALSE)
+m_red_ms  <- lmer(reduced_movie_subject,      data = master_fir_subj, REML = FALSE)
+
+cat("\n=== OMNIBUS TEST (movie + subject random intercepts) ===\n")
+print(anova(m_red_ms, m_full_ms))
+irf_subj <- tidy(m_full_ms, effects = "fixed") %>%
+  filter(grepl("seg_boundary_bin_coarse_t", term)) %>%
+  mutate(
+    term_clean = gsub("`", "", term),
+    lag = as.integer(gsub(".*_t", "", term_clean)),
+    lag_seconds = lag,
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+print(irf_subj, n = Inf)
+
+p_fixdur_Coarse_EB<-ggplot(irf_subj, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(color = significant), size = 3) +
+  scale_color_manual(values = c("TRUE" = "darkred", "FALSE" = "gray50")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) +
+  labs(
+    title = "FIR:CoarseEvent Boundary → Fixation Duration",
+    subtitle = "Each point = deviation from baseline (±10 s window)",
+    x = "Time relative to boundary (seconds)",
+    y = "Effect on Fixation Duration",
+    color = "p < .05"
+  ) +
+  theme_minimal(base_size = 14)
+p_fixdur_Coarse_EB
+```
+
+
+## Participant Model-Fitting Saccade Amplitude FIR model for the Event Boundaries
+```{r participants_model_test_new}
+# ============================================================
+# STEP 3: FIT FULL & REDUCED MIXED MODELS (OMNIBUS TEST)
+# ============================================================
+
+fir_terms <- paste0("`", fir_cols, "`")
+
+full_formula <- as.formula(
+  paste(
+    "mean_sacc_amp_px~",
+    paste(fir_terms, collapse = " + "),
+    "+ (1 | movie) +(1 | subject)"
+  )
+)
+
+reduced_formula <- as.formula(
+  "mean_sacc_amp_px ~ (1 | movie) +(1|subject)"
+)
+
+m_full <- lmer(full_formula, data = master_fir_subj, REML = FALSE)
+m_reduced <- lmer(reduced_formula, data = master_fir_subj, REML = FALSE)
+
+cat("\n=== OMNIBUS TEST ===\n")
+print(anova(m_reduced, m_full))
+
+# ============================================================
+# STEP 4: EXTRACT IRF (DEVIATION FROM BASELINE)
+# ============================================================
+
+irf <- tidy(m_full, effects = "fixed") %>%
+  filter(grepl("seg_boundary_bin_coarse_t", term)) %>%
+  mutate(
+    term_clean = gsub("`", "", term),            # ✅ remove backticks
+    lag = as.integer(gsub(".*_t", "", term_clean)),  # ✅ keeps sign (±)
+    lag_seconds = lag,
+    significant = p.value < 0.05
+  ) %>%
+  arrange(lag)
+
+print(irf, n = Inf)
+
+# ============================================================
+# STEP 5: PLOT PAPER-STYLE IRF
+# ============================================================
+
+p_SaccAmp_EB_subj <-ggplot(irf, aes(x = lag_seconds, y = estimate)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_ribbon(
+    aes(ymin = estimate - 1.96 * std.error,
+        ymax = estimate + 1.96 * std.error),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(color = significant), size = 3) +
+  scale_color_manual(values = c("TRUE" = "darkred", "FALSE" = "gray50")) +
+  scale_x_continuous(breaks = seq(-10, 10, 2)) +
+  labs(
+    title = "FIR:CoarseEvent Boundary → Saccade Amplitudes",
+    subtitle = "Each point = deviation from baseline (±10 s window)",
+    x = "Time relative to boundary (seconds)",
+    y = "Effect on Saccade Amplitudes",
+    color = "p < .05"
+  ) +
+  theme_minimal(base_size = 14)
+
+# ============================================================
+# STEP 6: ANTICIPATORY VS REACTIVE WINDOWS (AS IN PAPER)
+# ============================================================
+
+anticipatory <- irf %>% filter(lag < 0)
+reactive      <- irf %>% filter(lag > 0)
+
+cat("\nANTICIPATORY significant:", sum(anticipatory$significant), "\n")
+cat("REACTIVE significant:", sum(reactive$significant), "\n")
+p_SaccAmp_EB_subj 
+```
